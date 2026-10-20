@@ -1,0 +1,39 @@
+# The manifest of the README: an inventory deployment with one route group.
+celld:
+  application: inventory
+  base-url: https://inventory.internal.example/
+  runtime: workerd
+  connector-name: inventory-connector
+  space: data
+  credential:
+    bearer: s3cr3t-token
+  timeouts:
+    connect: 2s
+    request: 10s
+  max-body-bytes: 65536
+  freshness: PT2M
+  routes:
+    - name: stock
+      description: Stock levels by SKU and warehouse
+      shape: com.example.Stock#v1
+      freshness: 30s
+      operations:
+        - name: getStock
+          method: GET
+          path: /api/stock
+          params: [sku, warehouse]
+        - name: reserveStock
+          method: POST
+          path: /api/stock/reserve
+          params: [sku, qty, warehouse]
+          idempotent: true
+        - name: auditStock
+          method: post
+          path: /api/stock/audit
+          params: [warehouse]
+          idempotent: false
+    - name: rates
+      description: Repair rates by part
+      shape: com.example.Rate#v1
+      operations:
+        - { name: listRates, method: GET, path: /api/rates, params: [part] }
