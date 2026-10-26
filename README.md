@@ -1,16 +1,23 @@
 # agentspaces-connect-celld
 
-The Java connector for a celld or Workers deployment its team cannot change: an operator's
-manifest of allowlisted Worker routes becomes `workers://` AssetCards on `agentspaces-connect-core`,
-GET routes answer `aspace:cap/data-query`, POST routes answer `aspace:cap/asset-invoke`, and every
-call goes over HTTPS with the operator's bearer or mTLS credential and the invocation id as a
-header. It runs the same route-group mapping `@agentspaces/workers` runs inside a deployment,
-from outside it. It cannot enumerate bindings, so it publishes only what the manifest names.
+The Java connector that brings a celld or Workers deployment into an AgentSpaces fleet. It
+publishes the deployment's routes as AssetCards, so any agent in the fleet can discover them, query
+them, and invoke them through a space. An operator lists the Worker routes to share in a manifest,
+and the connector turns each route group into a `workers://` AssetCard on
+`agentspaces-connect-core`. Agents read through the GET routes with `aspace:cap/data-query` and act
+through the POST routes with `aspace:cap/asset-invoke`. The connector makes every call over HTTPS
+with the operator's bearer or mTLS credential and sends the invocation id as a header, so the
+deployment can recognize a retry. The manifest serves as the allowlist: the connector publishes
+the routes and operations it names, and refuses any other route, operation, or parameter before
+it calls the deployment. The connector runs beside the deployment and applies the same
+route-group mapping that `@agentspaces/workers` applies inside one, so a team can open an existing
+deployment to the fleet without changing its code or its bindings.
 
-**Architecture position.** Gateways and served interfaces: a connector (a non-agent member the
-fleet sees as assets). SPEC §6.1a, §6.3; TECH-SPEC §6. Design of record:
-`srad/agentspaces-js.md` §3.8, §4.7 (JS-C-07, JS-C-08, JS-C-09), §6.4 scenario S5a, §7.2,
-appendix F (the route-group row); `srad/celld-assetcard-analysis.md` §3 and §6.
+**Architecture position.** Gateways and served interfaces. The connector joins the fleet as a
+non-agent member that the other members see as a set of assets. It sits between the fleet and
+the deployment's HTTPS interface, holds the deployment's address and credential on its own host,
+and answers each query and invocation with a signed result through the data-query and
+asset-invoke protocols of `agentspaces-connect-core`.
 
 ## Coordinates
 
@@ -25,6 +32,117 @@ appendix F (the route-group row); `srad/celld-assetcard-analysis.md` §3 and §6
 It brings `agentspaces-connect-core` (the SPI and the protocols) and `agentspaces-runtime` (the
 plain-Java peer from a fleet file), both 0.4.0, plus Jackson for the manifest and the JSON bodies.
 Java 21. The jar's main class is `CelldConnector`.
+
+## What you can build with it
+
+The connector turns a deployment's routes into assets any member of the fleet can find, read, and
+act on. The agents that use them never hold the deployment's credential and never learn its
+address. They see a signed AssetCard, write a query or an invocation into a space, and read back
+the connector's signed result. That opens the deployment to kinds of agents that could not safely
+call it before.
+
+### Browser agents that read and act on a deployment
+
+A web page runs its agent in the page's worker, through `@agentspaces/browser`. The worker holds a
+fleet peer, and `@agentspaces/connect` gives that peer the same `DataQueryClient` and `invoke` the
+Java agents use. So a page can look up stock, reserve it, or start a job on a Worker route while the
+bearer token stays on the connector's host. The browser reaches the fleet over WebSocket, and the
+connector itself can be the seed it dials.
+
+`worker.ts`, bundled for the page with esbuild (`--format=esm --target=es2022`):
+
+```typescript
+import { host } from "@agentspaces/browser/worker";
+import { DataQueryClient, assetCards, invoke } from "@agentspaces/connect";
+
+host.onResume(async () => {
+  const peer = host.peer!;
+  const client = new DataQueryClient(peer, { requester: "stock-page" });
+  let card: Record<string, unknown> | null = null;
+  while (!card) {
+    peer.pullAds();                                   // a late joiner asks for the cards the group holds
+    card = assetCards(peer, "route/stock")[0] ?? null;
+    if (!card) await new Promise((r) => setTimeout(r, 200));
+  }
+  const stock = await client.fetch("route/stock", { op: "getStock", sku: "A-1" }, "15s");
+  const reserved = await invoke(client.space, card, "reserveStock", { sku: "A-1", qty: "1" });
+  // stock.result.rows holds the Worker's JSON rows; reserved.result holds its JSON answer.
+});
+```
+
+`page.ts`:
+
+```typescript
+import { connect } from "@agentspaces/browser";
+
+const host = await connect({
+  founding: "inventory-v1",
+  seeds: ["ws://127.0.0.1:7502/aspace"],
+  worker: new URL("./worker.js", import.meta.url),
+});
+```
+
+To let pages dial the connector directly, give its fleet file a WebSocket listener with the page's
+origin on the allowlist, and put `agentspaces-transport-http` 0.4.0 beside the connector (as a
+dependency of the application that runs it, or added to this project's `pom.xml` before
+`copy-dependencies`). The connector does not bring that module on its own, and without it the
+listener does not start.
+
+```yaml
+agentspaces:
+  security:
+    profile: dev-local                # a laptop only; on a shared network use wss and a TLS profile
+  bind: 127.0.0.1:7500
+  transport:
+    ws:
+      enabled: true
+      bind: 127.0.0.1:7502
+      allowed-origins: [ "http://127.0.0.1:8080" ]
+```
+
+The connector does not have to be the seed. A page can dial any member with a WebSocket listener,
+such as the `@agentspaces/node` seed in the `@agentspaces/browser` quick start, while the
+connector joins the same group over TCP. The cards and results reach the page through the group.
+
+The TypeScript packages are not on npm yet. Until they are, install them from a clone of
+`agentspaces-typescript`, as the `@agentspaces/browser` README shows.
+
+### Results that every agent shares
+
+A query's result is a live entry in the group's data space, keyed by the hash of the asset and its
+parameters. The next agent that asks the same question, in another browser, a Java service, or a
+Python script, reads that entry and the deployment is not called again until the result's
+freshness runs out. One page load can warm the answer for a whole fleet, and a dashboard with a
+thousand viewers costs the deployment about one call per distinct question per freshness window.
+Set the window per route group with `freshness` in the manifest.
+
+### Actions that run once, wherever they come from
+
+An invocation carries an id. The connector remembers the answer for each id, so a browser that
+retries after a dropped connection gets the first answer back and the route runs once. The route
+also receives the id as `Aspace-Invocation-Id`, and a handler that deduplicates on it stays safe
+across a connector restart; mark those routes `idempotent: true` so agents can see it on the card.
+The manifest's `invoke-ops` and the fleet's `aspace:connector-invoke:<asset>:<operation>` scopes
+decide who may run what, before any call leaves the connector.
+
+### Agents in any language on one deployment
+
+The connector speaks the fleet's data-query and asset-invoke entries, which the Java, TypeScript,
+and Python clients encode identically. A Spring AI or LangChain4j agent on the JVM, a Node
+service, a browser tab, and a Python notebook can all read and act on the same Worker routes
+through one connector and one credential.
+
+### What was run
+
+`CelldFleetTest` and `CelldConnectorTest` cover Java agents, in process and over TCP. On
+2026-10-25 a Node peer over TCP and a headless Chromium page over WebSocket ran the flow above
+against this connector's jar and a stand-in Worker. Each discovered the card, queried the GET
+route, and invoked the POST route. Under the Node peer, a retry under the same invocation id
+reached the Worker zero times, an unlisted operation was refused by its `invoke-ops` rule, and an
+identical query from a second peer was answered from the space without a call to the Worker. The
+Python client is tested against the same connector runtime in `agentspaces-connect-core`
+(`PythonConnectorClientTest`). Neither of those cross-language runs is part of this project's
+test suite yet.
 
 ## Using it
 
@@ -86,9 +204,17 @@ celld:
           idempotent: false           # the card says so: a retry may run it twice
 ```
 
+The jar names `CelldConnector` as its main class but carries no dependencies, so copy them beside
+it and start it with a classpath. Add an SLF4J binding (for example `slf4j-simple`) to `target/lib`
+to see the connector's log; without one it logs nothing.
+
 ```
-java -jar agentspaces-connect-celld-0.4.0.jar fleet.yaml             # manifest = the file's celld: subtree
-java -jar agentspaces-connect-celld-0.4.0.jar fleet.yaml manifest.yaml
+mvn -q clean package
+mvn -q dependency:copy-dependencies -DincludeScope=runtime -DoutputDirectory=target/lib
+java -cp 'target/agentspaces-connect-celld-0.4.0.jar:target/lib/*' \
+     ai.badmonkey.agentspaces.connect.celld.CelldConnector fleet.yaml               # manifest = the file's celld: subtree
+java -cp 'target/agentspaces-connect-celld-0.4.0.jar:target/lib/*' \
+     ai.badmonkey.agentspaces.connect.celld.CelldConnector fleet.yaml manifest.yaml
 ```
 
 In code: `CelldConnector.run(fleetFile, manifestFile)` returns the `FleetRuntime`; or build the
@@ -191,7 +317,7 @@ state: the deployment stays authoritative, and the fleet carries requests, resul
 ## Building
 
 ```
-mvn -q -o verify
+mvn -B -ntp verify
 ```
 
 The tests run against a local `com.sun.net.httpserver.HttpServer` standing in for the Worker
@@ -201,13 +327,43 @@ a deployment with a client-certificate listener.
 
 ## Notes
 
-- The connector cell (`@agentspaces/workers`) is the first choice for a deployment a team can
-  change: it reads bindings from its own `env` and needs no manifest beyond the allowlist. This
-  project is for the deployment that cannot change (decision 15, `srad/agentspaces-js.md` §6.8).
+- A team that wants the connector inside its deployment can add the connector cell
+  (`@agentspaces/workers`), which reads bindings from the deployment's own `env` and needs no
+  manifest beyond the allowlist. This project serves the same routes from beside the deployment,
+  driven by the operator's manifest, and leaves the deployment as it is.
 - `ConnectorRuntime` remembers an answered invocation for 24 h, so a retry under the same id
   never re-runs the route here; the handler's own `once(invocationId)` covers a connector that
   restarted in between, and `idempotent: false` tells agents which routes have none.
 
+## Releasing
+
+The `central-publish` profile attaches the sources and javadoc jars, signs
+every artifact with GPG (the passphrase from `MAVEN_GPG_PASSPHRASE`, or a GPG
+agent), and uploads through the Sonatype Central Portal using the `central`
+server id in `settings.xml`. The dry run builds the jars without signing or
+uploading anything:
+
+```sh
+mvn -Pcentral-publish -DskipTests -Dgpg.skip=true clean package
+```
+
+The release signs the artifacts and uploads them:
+
+```sh
+mvn -Pcentral-publish clean deploy
+```
+
+`autoPublish` is off, so the upload waits on the Portal as a validated bundle
+until you publish it there. CI runs the same profile unsigned on every push,
+so a javadoc or packaging problem fails a pull request before it can fail a
+release.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[code of conduct](CODE_OF_CONDUCT.md). Report a vulnerability privately, as
+[SECURITY.md](SECURITY.md) describes.
+
 ## Licence
 
-Apache License 2.0, Copyright 2026 Bad Monkey, Inc.
+Apache License 2.0, Copyright 2026 Bad Monkey, Inc. See `LICENSE` and `NOTICE`.

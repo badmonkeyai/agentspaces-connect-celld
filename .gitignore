@@ -41,7 +41,10 @@ Thumbs.db
 *.log
 /tmp/
 
-# Peer key material, client keystores and provider keys never belong in a repository
+# Peer key material, client keystores and provider keys never belong in a repository.
+# The README's example keystore path is ./keys. A manifest may carry a bearer token
+# inline (credential.bearer); prefer bearer-env or bearer-file, and keep such a file out.
+keys/
 peer.key
 peer.keys/
 *.pem
