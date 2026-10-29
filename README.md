@@ -289,7 +289,7 @@ state: the deployment stays authoritative, and the fleet carries requests, resul
 | File | What it is |
 | --- | --- |
 | `CelldManifest` | The manifest record and parser: application, base URL, runtime, credential (`Credential`), timeouts, body bound, freshness, the plaintext and authorizer switches, and `RouteGroup`s of `Operation`s (name, `GET`/`POST`, path, declared params, `idempotent`); `load(Path)`, `load(InputStream)`, `parse(String)`, `fromDocument` (the `celld:` subtree of a shared file). |
-| `CelldClient` | The `java.net.http.HttpClient` over the deployment: bearer header or client certificate, connect and request timeouts, the body bound, `get(operation, params)` and `post(operation, params, invocationId)`; `RouteException` carries the appendix F error code and the rule. |
+| `CelldClient` | The `java.net.http.HttpClient` over the deployment: bearer header or client certificate, connect and request timeouts, the body bound, `get(operation, params)` and `post(operation, params, invocationId)`; `RouteException` carries the error code (`target-error` or `timeout`) and the rule. |
 | `CelldAssetProvider` | The `AssetProvider`: `describeAssets` (the cards above), `query` (GET), `invoke` (POST); refuses unlisted routes and operations and undeclared parameters before any call. |
 | `CelldConnector` | The main and the `FleetParticipant`: `run(fleetFile, manifestFile)` starts a `FleetRuntime` from the fleet file and wires a `ConnectorRuntime` on the manifest's space with the group's discovery and, by default, the fleet's authorizer; refreshes cards on the card cadence; closes with the runtime. |
 
@@ -301,18 +301,18 @@ state: the deployment stays authoritative, and the fleet carries requests, resul
 
 ## Requirements to tests
 
-| Row (srad/agentspaces-js.md) | Test |
+| Requirement | Test |
 | --- | --- |
-| JS-C-09 the manifest format: base URL, bearer or mTLS credential, route groups with mode, params, shape, `idempotent` | `CelldManifestTest.theReadmeManifestParsesWithEveryFieldBound`, `defaultsFillWhatAMinimalManifestLeavesOut`, `credentialsAreABearerOrAnMtlsKeyStore`, `durationsTakeIsoAndTheShortForm`, `routeGroupsExposeTheirOperationsByKind` |
-| JS-C-09 the manifest shares the fleet file or stands alone; typos and unsafe settings fail at startup naming the place | `CelldManifestTest.theManifestMayStandAloneOrShareTheFleetFile`, `thePlaintextRuleAndTheUrlRules`, `unknownKeysAndBadShapesFailNamingThePlace` |
-| JS-C-08 / appendix F the `workers://<application>/route/<name>` cards with `read-ops`, `invoke-ops`, `idempotent`, `runtime`, `connector = java`; ids stable across refreshes | `CelldAssetProviderTest.cardsFollowAppendixFWithStableIds` |
-| JS-C-09 a read is a GET with the declared parameters as query parameters and the bearer header; the JSON body is the rows; `op` defaults on a single read operation | `CelldAssetProviderTest.aReadIsAGetWithTheDeclaredParametersAsQueryParametersAndTheBearer`, `aReadWithoutOpOnAGroupWithSeveralReadOperationsIsRefused` |
-| JS-C-09 / appendix F an invocation is a POST with the parameters as the JSON body and `Aspace-Invocation-Id`; the JSON body is the result | `CelldAssetProviderTest.anInvocationIsAPostWithTheJsonBodyAndTheInvocationIdHeader` |
-| JS-C-07 an unlisted route or operation, or an undeclared parameter, is refused with an error naming the rule and never called | `CelldAssetProviderTest.refusalsNameTheRuleAndNeverCallTheDeployment`, `CelldFleetTest.anUnlistedOperationAndAnUndeclaredParameterNeverReachTheWorker` |
-| JS-C-09 every bound is a manifest setting: `timeouts.request`, `max-body-bytes`; target failures become error results | `CelldAssetProviderTest.targetFailuresBecomeErrorResultsNamingTheBound`, `theMtlsStoresAreLoadedWhenNamed` |
-| S5a / JS-C-03, JS-C-10 an agent discovers the card, queries through `DataQueryClient` (one GET per freshness window), and invokes through `AssetInvocations.invoke` exactly once under a retry (the stub Worker counts calls per invocation id) | `CelldFleetTest.anAgentDiscoversTheCardQueriesTheGetRouteAndInvokesThePostRouteOnceUnderARetry` |
-| JS-C-02 under an authorizer only a requester holding `aspace:connector-invoke:<asset>:<operation>` reaches the route | `CelldFleetTest.underAnAuthorizerOnlyARequesterHoldingTheInvokeScopeReachesTheWorker` |
-| JS-C-09 the main joins a group from a fleet file of the `agentspaces:` shape and serves the manifest; a second peer joins through the seed over TCP, discovers, queries, and invokes | `CelldConnectorTest.theMainJoinsFromTheFleetFileAndServesTheManifest`, `aSeparateManifestFileIsReadBesideTheFleetFile`, `aManifestNamingASpaceTheGroupLacksFailsAtStartupNamingTheProperty` |
+| The manifest format: base URL, bearer or mTLS credential, route groups with mode, params, shape, `idempotent` | `CelldManifestTest.theReadmeManifestParsesWithEveryFieldBound`, `defaultsFillWhatAMinimalManifestLeavesOut`, `credentialsAreABearerOrAnMtlsKeyStore`, `durationsTakeIsoAndTheShortForm`, `routeGroupsExposeTheirOperationsByKind` |
+| The manifest shares the fleet file or stands alone; typos and unsafe settings fail at startup naming the place | `CelldManifestTest.theManifestMayStandAloneOrShareTheFleetFile`, `thePlaintextRuleAndTheUrlRules`, `unknownKeysAndBadShapesFailNamingThePlace` |
+| One `workers://<application>/route/<name>` card per route group with `read-ops`, `invoke-ops`, `idempotent`, `runtime`, `connector = java`; ids stable across refreshes | `CelldAssetProviderTest.cardsFollowAppendixFWithStableIds` |
+| A read is a GET with the declared parameters as query parameters and the bearer header; the JSON body is the rows; `op` defaults on a single read operation | `CelldAssetProviderTest.aReadIsAGetWithTheDeclaredParametersAsQueryParametersAndTheBearer`, `aReadWithoutOpOnAGroupWithSeveralReadOperationsIsRefused` |
+| An invocation is a POST with the parameters as the JSON body and `Aspace-Invocation-Id`; the JSON body is the result | `CelldAssetProviderTest.anInvocationIsAPostWithTheJsonBodyAndTheInvocationIdHeader` |
+| An unlisted route or operation, or an undeclared parameter, is refused with an error naming the rule and never called | `CelldAssetProviderTest.refusalsNameTheRuleAndNeverCallTheDeployment`, `CelldFleetTest.anUnlistedOperationAndAnUndeclaredParameterNeverReachTheWorker` |
+| Every bound is a manifest setting: `timeouts.request`, `max-body-bytes`; target failures become error results | `CelldAssetProviderTest.targetFailuresBecomeErrorResultsNamingTheBound`, `theMtlsStoresAreLoadedWhenNamed` |
+| An agent discovers the card, queries through `DataQueryClient` (one GET per freshness window), and invokes through `AssetInvocations.invoke` exactly once under a retry (the stub Worker counts calls per invocation id) | `CelldFleetTest.anAgentDiscoversTheCardQueriesTheGetRouteAndInvokesThePostRouteOnceUnderARetry` |
+| Under an authorizer only a requester holding `aspace:connector-invoke:<asset>:<operation>` reaches the route | `CelldFleetTest.underAnAuthorizerOnlyARequesterHoldingTheInvokeScopeReachesTheWorker` |
+| The main joins a group from a fleet file of the `agentspaces:` shape and serves the manifest; a second peer joins through the seed over TCP, discovers, queries, and invokes | `CelldConnectorTest.theMainJoinsFromTheFleetFileAndServesTheManifest`, `aSeparateManifestFileIsReadBesideTheFleetFile`, `aManifestNamingASpaceTheGroupLacksFailsAtStartupNamingTheProperty` |
 
 ## Building
 
