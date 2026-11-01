@@ -36,7 +36,7 @@ jobs:
           java-version: '21'
           cache: maven
       - name: Build, test, and attach sources and javadoc
-        # The AgentSpaces 0.4.0 artifacts (agentspaces-connect-core and
+        # The AgentSpaces 0.5.0 artifacts (agentspaces-connect-core and
         # agentspaces-runtime) resolve from Maven Central. The tests use a local
         # HTTP server for the Worker and need no other network. The publication
         # profile runs unsigned here, so a javadoc or packaging problem fails the

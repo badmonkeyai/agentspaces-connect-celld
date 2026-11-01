@@ -25,12 +25,12 @@ asset-invoke protocols of `agentspaces-connect-core`.
 <dependency>
   <groupId>ai.badmonkey.agentspaces</groupId>
   <artifactId>agentspaces-connect-celld</artifactId>
-  <version>0.4.0</version>
+  <version>0.5.0</version>
 </dependency>
 ```
 
 It brings `agentspaces-connect-core` (the SPI and the protocols) and `agentspaces-runtime` (the
-plain-Java peer from a fleet file), both 0.4.0, plus Jackson for the manifest and the JSON bodies.
+plain-Java peer from a fleet file), both 0.5.0, plus Jackson for the manifest and the JSON bodies.
 Java 21. The jar's main class is `CelldConnector`.
 
 ## What you can build with it
@@ -83,7 +83,7 @@ const host = await connect({
 ```
 
 To let pages dial the connector directly, give its fleet file a WebSocket listener with the page's
-origin on the allowlist, and put `agentspaces-transport-http` 0.4.0 beside the connector (as a
+origin on the allowlist, and put `agentspaces-transport-http` 0.5.0 beside the connector (as a
 dependency of the application that runs it, or added to this project's `pom.xml` before
 `copy-dependencies`). The connector does not bring that module on its own, and without it the
 listener does not start.
@@ -211,9 +211,9 @@ to see the connector's log; without one it logs nothing.
 ```
 mvn -q clean package
 mvn -q dependency:copy-dependencies -DincludeScope=runtime -DoutputDirectory=target/lib
-java -cp 'target/agentspaces-connect-celld-0.4.0.jar:target/lib/*' \
+java -cp 'target/agentspaces-connect-celld-0.5.0.jar:target/lib/*' \
      ai.badmonkey.agentspaces.connect.celld.CelldConnector fleet.yaml               # manifest = the file's celld: subtree
-java -cp 'target/agentspaces-connect-celld-0.4.0.jar:target/lib/*' \
+java -cp 'target/agentspaces-connect-celld-0.5.0.jar:target/lib/*' \
      ai.badmonkey.agentspaces.connect.celld.CelldConnector fleet.yaml manifest.yaml
 ```
 
