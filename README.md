@@ -225,7 +225,8 @@ it as a `FleetParticipant`. Durations take ISO-8601 (`PT5M`) or the short form (
 ### What the fleet sees
 
 One `AssetCard` per route group (SPEC §6.1a fields, nothing added), id `<application>:route/<name>`
-so a refresh replaces the earlier card:
+so a refresh replaces the earlier card (`<application>:route/<name>@<connector-name>` in
+active-active mode, below):
 
 | Field | Value |
 |---|---|
@@ -268,6 +269,185 @@ Each refusal names its rule and is answered without a call to the deployment:
 | a body over `max-body-bytes` | `target-error`, rule `max-body-bytes` |
 | a route past `timeouts.request` | `timeout`, rule `timeouts.request` |
 
+## Large data, objects, and changes
+
+With the fleet's content swarm on (`agentspaces.capabilities.enabled: true` and
+`agentspaces.content.enabled: true` in the fleet file), the connector moves data of any size
+between the deployment and the fleet. Every feature below is opt-in by a manifest key, and a
+manifest without them behaves exactly as before. A manifest that uses one while the swarm is off
+fails at startup, naming `agentspaces.content.enabled`.
+
+```yaml
+celld:
+  # ... application, base-url, credential, as above ...
+  state: /var/lib/celld-connector/inventory   # the object index and the change cursor
+  timeouts: { request: 30s, transfer: 30m, fetch: 30m }
+  artifacts:
+    max-bytes: 4GiB          # the largest body the connector publishes
+    inline-max: 4MiB         # result: auto answers rows below this, an artifact above it
+    piece-size: 1MiB         # default: the fleet's agentspaces.content.piece-size
+    lease: P7D               # the manifest lease
+    replicate: true          # write the manifest to the content space
+  routes:
+    - name: exports
+      operations:
+        - { name: nightly, method: GET, path: /api/exports/nightly, result: artifact, media-type: application/x-ndjson }
+    - name: stock
+      operations:
+        - { name: getStock, method: GET, path: /api/stock, params: [sku] }
+        - { name: snapshot, method: GET, path: /api/stock/snapshot, result: artifact,
+            media-type: application/x-ndjson, snapshot: true, consistency: snapshot, refresh: PT1H, keep: 2 }
+    - name: ingest
+      operations:
+        - { name: load, method: POST, path: /api/ingest, params: [source, batch],
+            body: artifact, artifact-param: source, max-upload-bytes: 1GiB }
+  objects:
+    - name: models
+      list: /api/models              # GET ?after=&limit= -> {items: [{key, size, etag, mediaType, attrs}], after}
+      get: /api/models/object        # GET ?key=<key> with Range and If-Match -> 206
+      cadence: PT5M
+      piece-size: 4MiB
+      hash-budget: 2GiB              # bytes hashed per list pass
+      collection: { name: models, description: Model checkpoints of the inventory deployment }
+  changes:
+    path: /api/changes               # GET ?after=<cursor>&limit=<n> -> {cursor, changes}
+    poll: 10s
+    stream: /api/changes/stream      # optional Server-Sent Events over the same cursor
+  replicas: { mode: single }         # or active-active
+```
+
+### Large results
+
+An operation with `result: artifact` streams its body into the swarm and answers one artifact
+row: `root`, `pieces`, `size`, `mediaType`, `name`, and `taken`. `result: auto` answers rows below
+`inline-max` and an artifact above it. The connector counts the bytes as it reads them, so the
+bound holds although celld removes `Content-Length` from a Worker's response; a body over
+`max-bytes`, or still open after `timeouts.transfer`, publishes nothing and answers an error naming
+the bound. A repeated query within the freshness window reads the same row from the space, so
+twenty agents asking for the morning export cost one call to the deployment, and the agents then
+fetch the pieces from the connector and from each other. `max-body-bytes` keeps its meaning: the
+bound on an inline JSON body.
+
+```java
+DataQueryClient client = new DataQueryClient(fleet.group().space("data"), "planner");
+Map<String, String> row = client.fetch("route/exports", Map.of("op", "nightly"), Duration.ofSeconds(30))
+        .orElseThrow().result().rows().getFirst();
+ArtifactRows.Artifact export = ArtifactRows.parse(row).orElseThrow();   // agentspaces-connect-core
+Fetch fetch = fleet.content().orElseThrow().fetch(export.root());        // from every holder at once
+```
+
+### Snapshots
+
+A GET operation with `snapshot: true` serializes state the Worker chooses, such as a Durable
+Object's rows walked with `ctx.storage.sql.exec`. celld offers no Durable Object export or
+point-in-time recovery, so the Worker author owns the consistency the manifest declares
+(`snapshot` or `best-effort`). The connector takes the snapshot on `refresh`, and again when a
+change notice names the route, at most once per `min-interval`. It tags each manifest
+`snapshot-of=<application>:route/<name>` and `taken=<instant>`, so `Content.search` finds the
+newest, and keeps the newest `keep` roots pinned.
+
+### Objects served where they lie
+
+An object source serves a deployment's objects to the swarm without a copy. Each pass lists the
+objects, hashes each new key and ETag once (within `hash-budget`), and publishes it through an
+`http-range` store: every piece a member asks for is one `GET <get>?key=<key>` with `Range` and
+`If-Match`, hashed whole at its first serve and cached on the connector's disk for the sub-ranges
+that follow. A 412, a 416, a whole body in answer to a range, or a changed ETag forgets the root,
+and the next pass hashes the new version; a key that leaves the list leaves the collection. Keys
+travel only as an encoded query value, and a key over 1,024 bytes or with control characters is
+refused. The index under `state` lets a restart register unchanged objects without reading them.
+A source with a `collection` advertises a `content-collection` card, `content:<name>`, which
+answers `tag` (an attribute value), `mediaType`, `namePrefix`, `origin`, `maxAgeMillis`, `after`,
+and `limit`. The get route must honour ranges; `@agentspaces/workers/routes` has `serveRange` for
+an R2 bucket.
+
+### Artifact inputs
+
+An operation with `body: artifact` carries an artifact from the fleet into the deployment. The
+requester passes a content root in `artifact-param`; the connector checks the requester may fetch
+that root (`aspace:content-fetch`), refuses an artifact over `max-upload-bytes` before fetching it,
+fetches it from every holder within `timeouts.fetch`, and POSTs the plaintext with
+`Content-Length`, the other parameters as query parameters, `Aspace-Invocation-Id`, and
+`Aspace-Content-Root`. The connector keeps the invocation claimed while it works, so a retry waits
+for the one answer. `body: artifact-chunked` sends the artifact piece by piece (`Aspace-Upload:
+piece` with `Aspace-Piece-Index`, then `Aspace-Upload: finish`), for an artifact above the
+deployment's body bound: celld accepts 1 GiB by default (`CELLD_MAX_REQUEST_BODY_BYTES`), and
+Cloudflare's Free and Pro plans accept 100 MB.
+
+### Change notices
+
+celld offers no change feed or outside Queue consumer, so the Worker serves its own: a change
+route that answers `{cursor, changes: [{kind, route | object, key, row?}]}` after a cursor
+(`kind` is `upsert`, `delete`, or `object`). The connector polls it, or holds its Server-Sent
+Events stream and reconnects with `Last-Event-ID`, and keeps the cursor under `state`. A route
+change becomes a leased `AssetChange` for `route/<name>`, withdraws the connector's cached results
+for it so the next query reaches the deployment, and refreshes its snapshots; an object change
+lists the object source again. A first start takes the cursor and replays no history. A change
+never runs an operation, and an unknown kind, route, or object is dropped and counted.
+`ChangeLog` in `@agentspaces/workers/routes` keeps the log in a Durable Object's SQLite.
+
+### Several connectors for one deployment
+
+With `replicas: { mode: active-active }`, two or more connectors with their own identities serve
+one manifest. Each card id carries the connector name (`inventory:route/stock@inv-a`), because the
+fleet's card cache keys cards by id. Before it runs an invocation, a connector looks for a result
+another replica already wrote and answers with it, and each replica writes the others' results
+again under its own identity, so a requester gets its answer through whichever card it used; the
+Worker still deduplicates on `Aspace-Invocation-Id` for the race in between. A non-idempotent
+operation needs `non-idempotent-on: <connector-name>`, and only that connector advertises it. Equal
+bytes give equal roots, so the replicas' holdings merge, and the live replica with the lowest peer
+id polls the change route, leaving its cursor in the space for the next one.
+
+### A deployment behind NAT
+
+A connector that sets no `agentspaces.bind` only dials out and reaches the fleet through relays,
+on a pinned path of up to four. Its cards, results, and pieces reach cloud agents that way, and a
+relay that loses a link tells the origin, which finds another path. On a metered uplink, set
+`agentspaces.content.upload-bytes-per-day` and `seed-mode: complete-only` on the connector, and
+`agentspaces.relay.budget-bytes-per-day` on the site's relay; fetchers that complete serve each
+other, so the uplink carries each piece about once.
+
+### The proxy in front of celld
+
+celld terminates TLS on neither of its listeners and authenticates no user: its documentation
+says to terminate TLS and authenticate in a proxy or the application. Point `base-url` at a proxy
+in front of celld's public listener that checks the connector's bearer token or client
+certificate, and never at the internal listener, which carries the operator API. With Caddy:
+
+```
+inventory.internal.example {
+    @connector header Authorization "Bearer {$INVENTORY_TOKEN}"
+    handle @connector {
+        reverse_proxy 127.0.0.1:8787
+    }
+    respond 401
+}
+```
+
+### Card keys and refusals
+
+The route-group card adds these `access` keys when the manifest uses the features:
+
+| Key | Value |
+|---|---|
+| `artifact-ops`, `media-type-<op>` | the operations that answer with an artifact, and each one's media type |
+| `snapshot-ops`, `consistency-<op>` | the snapshot operations, and each one's declared consistency |
+| `upload-ops`, `artifact-param-<op>` | the operations that take an artifact body, and the parameter carrying the root |
+| `changes` | `true` when a change route covers the group |
+
+| Request | Answer |
+|---|---|
+| an artifact operation while the swarm is off | query error `artifacts: ...`; invoke `target-error`, rule `artifacts` |
+| a body over `artifacts.max-bytes`, or open past `timeouts.transfer` | `target-error`, rule `artifacts.max-bytes`; `timeout`, rule `timeouts.transfer` |
+| an artifact parameter that is not a content root | `bad-params`, rule `artifact-param` |
+| a requester that may not fetch the root | `refused-scope`, rule `content-fetch` |
+| an artifact over `max-upload-bytes`, or a 413 from the route | `target-error`, rule `max-upload-bytes` |
+| an artifact not fetched within `timeouts.fetch` | `timeout`, rule `timeouts.fetch` |
+
+`CelldConnector.stats()` counts the calls, the queries and invocations, the artifacts and their
+bytes, the ranged reads and misses, the uploads, the changes seen and dropped, the keys refused,
+the roots forgotten, and the relay signals.
+
 ## Trust boundary
 
 The connector's identity holds the authority over the routes it lists: it signs the cards and
@@ -291,11 +471,19 @@ state: the deployment stays authoritative, and the fleet carries requests, resul
 | `CelldManifest` | The manifest record and parser: application, base URL, runtime, credential (`Credential`), timeouts, body bound, freshness, the plaintext and authorizer switches, and `RouteGroup`s of `Operation`s (name, `GET`/`POST`, path, declared params, `idempotent`); `load(Path)`, `load(InputStream)`, `parse(String)`, `fromDocument` (the `celld:` subtree of a shared file). |
 | `CelldClient` | The `java.net.http.HttpClient` over the deployment: bearer header or client certificate, connect and request timeouts, the body bound, `get(operation, params)` and `post(operation, params, invocationId)`; `RouteException` carries the error code (`target-error` or `timeout`) and the rule. |
 | `CelldAssetProvider` | The `AssetProvider`: `describeAssets` (the cards above), `query` (GET), `invoke` (POST); refuses unlisted routes and operations and undeclared parameters before any call. |
-| `CelldConnector` | The main and the `FleetParticipant`: `run(fleetFile, manifestFile)` starts a `FleetRuntime` from the fleet file and wires a `ConnectorRuntime` on the manifest's space with the group's discovery and, by default, the fleet's authorizer; refreshes cards on the card cadence; closes with the runtime. |
+| `CelldConnector` | The main and the `FleetParticipant`: `run(fleetFile, manifestFile)` (or `launch`, which returns the connector too) starts a `FleetRuntime` from the fleet file with the object stores in the swarm and wires a `ConnectorRuntime` on the manifest's space with the group's discovery and, by default, the fleet's authorizer; wires the parts below when the manifest names them; elects the change poller among replicas; refreshes cards on the card cadence; `stats()`; closes with the runtime. |
+| `ArtifactResults` | Large results and snapshots: streams a body into `Content.publish`, bounded by bytes read and the transfer deadline, and answers the artifact row; keeps each operation's newest roots pinned. |
+| `ArtifactUploads` | Artifact inputs: checks the artifact parameter and `CONTENT_FETCH`, fetches the root, and streams it to the route whole or piece by piece. |
+| `HttpRangePieceStore` | The read-only `http-range` content store: one ranged, conditional GET per piece read; a miss forgets the root. |
+| `ObjectSources` | Lists each object source, hashes within the budget, publishes through `Content.publishExternal`, forgets what left, keeps the restart index, and builds the collection cards. |
+| `ChangeWatcher` | Polls or streams the change route, keeps the cursor, and passes route and object changes on. |
+| `SnapshotScheduler` | Takes snapshots on their cadence and on change, at most once per `min-interval`. |
+| `BoundedBody` | A response body bounded by bytes read and by a deadline, whatever the headers say. |
 
 ## Key dependencies
 
-`agentspaces-connect-core` (SPI, `ConnectorRuntime`, `AssetInvocations`, `DataQueryClient`),
+`agentspaces-connect-core` (SPI, `ConnectorRuntime`, `AssetInvocations`, `DataQueryClient`,
+`ArtifactRows`), `agentspaces-content` (the swarm, `ExternalStore`, `CollectionAssetProvider`),
 `agentspaces-runtime` (the plain-Java peer, `PropertiesLoader`), `jackson-databind`,
 `jackson-dataformat-yaml`, `slf4j-api`. No framework: the enforcer bans Spring and Micronaut.
 
@@ -313,6 +501,14 @@ state: the deployment stays authoritative, and the fleet carries requests, resul
 | An agent discovers the card, queries through `DataQueryClient` (one GET per freshness window), and invokes through `AssetInvocations.invoke` exactly once under a retry (the stub Worker counts calls per invocation id) | `CelldFleetTest.anAgentDiscoversTheCardQueriesTheGetRouteAndInvokesThePostRouteOnceUnderARetry` |
 | Under an authorizer only a requester holding `aspace:connector-invoke:<asset>:<operation>` reaches the route | `CelldFleetTest.underAnAuthorizerOnlyARequesterHoldingTheInvokeScopeReachesTheWorker` |
 | The main joins a group from a fleet file of the `agentspaces:` shape and serves the manifest; a second peer joins through the seed over TCP, discovers, queries, and invokes | `CelldConnectorTest.theMainJoinsFromTheFleetFileAndServesTheManifest`, `aSeparateManifestFileIsReadBesideTheFleetFile`, `aManifestNamingASpaceTheGroupLacksFailsAtStartupNamingTheProperty` |
+| Every new manifest key binds with its default; a manifest without them uses no swarm; each artifact, snapshot, upload, size, piece-size, version, and replica rule fails at startup naming the place | `CelldManifestPhase2Test.everyPhase2KeyBindsWithItsValue`, `defaultsFillTheNewBlocksAndAZeroPointFiveManifestUsesNoSwarm`, `theArtifactRulesFailAtStartupNamingThePlace`, `activeActiveRefusesANonIdempotentOperationUnlessOneConnectorOwnsIt`, `sizesTakeBytesAndTheBinarySuffixes` |
+| A ranged read accepts only a matching 206 and misses on 412, 416, a short range, or 404; a body is bounded by bytes read and by the transfer deadline; a hostile key travels only as one query value; the event stream resumes after the last id | `CelldClientPhase2Test.aRangedReadAcceptsOnlyAMatching206AndMissesOnEveryOtherAnswer`, `aBodyIsBoundedByTheBytesReadWhateverTheHeadersSay`, `aStalledBodyEndsAtTheTransferDeadline`, `hostileKeysAreRefusedAndOrdinaryOnesTravelEncoded`, `theEventStreamFollowsTheSseFormatAndResumesAfterTheLastId` |
+| A large result leaves as one artifact from one call, and every fetcher reads it; a body over the bound publishes nothing; `auto` answers rows below the bound and an artifact above it | `CelldSwarmFleetTest.aLargeResultLeavesAsOneArtifactAndEveryFetcherReadsItFromOneCall`, `aBodyOverTheBoundPublishesNothingAndAutoAnswersInlineBelowIt` |
+| Objects are served where they lie with one ranged read per piece, listed in a collection, and forgotten when they change or leave; a restart registers indexed objects without reading them | `CelldSwarmFleetTest.objectsAreServedWhereTheyLieListedInACollectionAndForgottenWhenTheyChange`, `aRestartRegistersIndexedObjectsWithoutReadingThemAgain` |
+| An artifact reaches the ingest route once under a retry, whole or piece by piece; an oversize artifact and a value that is not a root are refused before any fetch | `CelldSwarmFleetTest.anArtifactReachesTheIngestRouteOnceWholeOrPieceByPieceAndBoundsRefuseBeforeFetching` |
+| A change becomes an `AssetChange`, withdraws the cached result, and refreshes the snapshot | `CelldSwarmFleetTest.aChangeBecomesAnAssetChangeWithdrawsTheCachedResultAndRefreshesTheSnapshot` |
+| Two connectors share one deployment with their own cards, one change poller, and one effect per invocation | `CelldSwarmFleetTest.twoConnectorsShareOneDeploymentWithTheirOwnCardsAndOneEffectPerInvocation` |
+| An artifact manifest without the swarm fails at startup naming the property | `CelldSwarmFleetTest.anArtifactManifestWithoutTheSwarmFailsAtStartupNamingTheProperty` |
 
 ## Building
 
@@ -324,6 +520,13 @@ The tests run against a local `com.sun.net.httpserver.HttpServer` standing in fo
 and an in-process SimNetwork fleet (plus one loopback TCP fleet for the main); no network, no
 celld. The mTLS path is exercised to the point of loading the stores; a live mTLS exchange needs
 a deployment with a client-certificate listener.
+
+## The end-to-end harness
+
+`e2e/run.sh` runs the connector against a real celld node on one machine: Azurite as the fleet
+bucket, the celld release binary, a test application with a Durable Object and two R2 buckets,
+and `CelldLiveTest` from an agent peer. It needs no cloud account and no Docker; `e2e/README.md`
+lists what it needs and what it checks.
 
 ## Notes
 

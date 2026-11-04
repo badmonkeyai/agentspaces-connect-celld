@@ -206,8 +206,8 @@ class CelldManifestTest {
                 .hasMessageContaining("celld has unknown keys [app]");
         assertThatThrownBy(() -> CelldManifest.parse(MINIMAL.replace("- name: orders", "- name: orders\n      sql: x")))
                 .hasMessageContaining("celld.routes[orders] has unknown keys [sql]");
-        assertThatThrownBy(() -> CelldManifest.parse(MINIMAL.replace("path: /orders }", "path: /orders, body: x }")))
-                .hasMessageContaining("celld.routes[orders].operations[listOrders] has unknown keys [body]");
+        assertThatThrownBy(() -> CelldManifest.parse(MINIMAL.replace("path: /orders }", "path: /orders, headers: x }")))
+                .hasMessageContaining("celld.routes[orders].operations[listOrders] has unknown keys [headers]");
         assertThatThrownBy(() -> CelldManifest.parse(MINIMAL.replace("method: GET", "method: DELETE")))
                 .hasMessageContaining("'DELETE' must be GET (a read operation) or POST (an invoke operation)");
         assertThatThrownBy(() -> CelldManifest.parse(MINIMAL.replace("path: /orders }", "path: /orders, idempotent: false }")))

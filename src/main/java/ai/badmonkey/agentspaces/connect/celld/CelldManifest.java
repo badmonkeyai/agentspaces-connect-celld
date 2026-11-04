@@ -84,12 +84,21 @@ import java.util.Set;
  * @param allowPlaintext  whether an {@code http://} base URL is accepted (tests and private networks)
  * @param fleetAuthorizer whether the fleet's authorizer gates serving and invoking
  * @param routes          the allowlisted route groups, one card each
+ * @param artifacts       the bounds and publish options for results that leave as artifacts
+ * @param objects         the object sources served to the swarm by ranged reads
+ * @param changes         the change route, or {@code null}
+ * @param replicas        how this connector shares its deployment with other connectors
+ * @param transferTimeout the bound on a whole streamed body (large results, uploads)
+ * @param fetchTimeout    the bound on fetching an artifact input from the swarm
+ * @param state           the directory for the object index and the change cursor
  */
 public record CelldManifest(String application, URI baseUrl, String runtime, String connectorName,
                             String group, String space, Credential credential,
                             Duration connectTimeout, Duration requestTimeout, long maxBodyBytes,
                             Duration freshness, boolean allowPlaintext, boolean fleetAuthorizer,
-                            List<RouteGroup> routes) {
+                            List<RouteGroup> routes, Artifacts artifacts, List<ObjectSource> objects,
+                            Changes changes, Replicas replicas, Duration transferTimeout, Duration fetchTimeout,
+                            Path state) {
 
     /** The top-level key of the manifest document. */
     public static final String KEY = "celld";
@@ -100,13 +109,27 @@ public record CelldManifest(String application, URI baseUrl, String runtime, Str
     private static final Set<String> RUNTIMES = Set.of("celld", "workerd", "cloudflare");
     private static final Set<String> TOP_KEYS = Set.of("application", "base-url", "runtime", "connector-name",
             "group", "space", "credential", "timeouts", "max-body-bytes", "freshness", "allow-plaintext",
-            "fleet-authorizer", "routes");
+            "fleet-authorizer", "routes", "artifacts", "objects", "changes", "replicas", "state");
     private static final Set<String> CREDENTIAL_KEYS = Set.of("bearer", "bearer-env", "bearer-file", "mtls");
     private static final Set<String> MTLS_KEYS = Set.of("key-store", "key-store-password", "key-store-type",
             "trust-store", "trust-store-password", "trust-store-type");
-    private static final Set<String> TIMEOUT_KEYS = Set.of("connect", "request");
+    private static final Set<String> TIMEOUT_KEYS = Set.of("connect", "request", "transfer", "fetch");
     private static final Set<String> ROUTE_KEYS = Set.of("name", "description", "shape", "freshness", "operations");
-    private static final Set<String> OPERATION_KEYS = Set.of("name", "method", "path", "params", "idempotent");
+    private static final Set<String> OPERATION_KEYS = Set.of("name", "method", "path", "params", "idempotent",
+            "result", "media-type", "snapshot", "consistency", "refresh", "min-interval", "keep", "body",
+            "artifact-param", "max-upload-bytes");
+    private static final Set<String> ARTIFACT_KEYS = Set.of("v", "max-bytes", "inline-max", "piece-size", "lease",
+            "replicate");
+    private static final Set<String> OBJECT_KEYS = Set.of("v", "name", "list", "get", "cadence", "piece-size",
+            "hash-budget", "replicate", "collection");
+    private static final Set<String> COLLECTION_KEYS = Set.of("name", "description", "freshness");
+    private static final Set<String> CHANGE_KEYS = Set.of("v", "path", "poll", "stream", "max-changes");
+    private static final Set<String> REPLICA_KEYS = Set.of("v", "mode", "non-idempotent-on");
+    /** The media type of an inline result. */
+    public static final String JSON = "application/json";
+    /** The swarm's piece-size bounds ({@code PublishOptions}). */
+    private static final int MIN_PIECE = 64 * 1024;
+    private static final int MAX_PIECE = 4 * 1024 * 1024;
 
     public CelldManifest {
         Objects.requireNonNull(application, "application");
@@ -119,6 +142,174 @@ public record CelldManifest(String application, URI baseUrl, String runtime, Str
         Objects.requireNonNull(requestTimeout, "requestTimeout");
         Objects.requireNonNull(freshness, "freshness");
         routes = List.copyOf(Objects.requireNonNull(routes, "routes"));
+        artifacts = artifacts == null ? Artifacts.defaults() : artifacts;
+        objects = objects == null ? List.of() : List.copyOf(objects);
+        replicas = replicas == null ? Replicas.single() : replicas;
+        transferTimeout = transferTimeout == null ? Duration.ofMinutes(30) : transferTimeout;
+        fetchTimeout = fetchTimeout == null ? Duration.ofMinutes(30) : fetchTimeout;
+        state = state == null ? defaultState(application) : state;
+    }
+
+    /** The 0.5.0 form: no artifacts, objects, changes, or replicas. */
+    public CelldManifest(String application, URI baseUrl, String runtime, String connectorName,
+                         String group, String space, Credential credential,
+                         Duration connectTimeout, Duration requestTimeout, long maxBodyBytes,
+                         Duration freshness, boolean allowPlaintext, boolean fleetAuthorizer,
+                         List<RouteGroup> routes) {
+        this(application, baseUrl, runtime, connectorName, group, space, credential, connectTimeout, requestTimeout,
+                maxBodyBytes, freshness, allowPlaintext, fleetAuthorizer, routes, null, null, null, null, null, null,
+                null);
+    }
+
+    private static Path defaultState(String application) {
+        return Path.of(System.getProperty("user.home"), ".agentspaces", "celld", application);
+    }
+
+    /** Whether any feature needs the fleet's content swarm ({@code agentspaces.content.enabled}). */
+    public boolean usesSwarm() {
+        return !objects.isEmpty() || routes.stream().flatMap(r -> r.operations().stream())
+                .anyMatch(o -> o.result() != Result.INLINE || o.body() != Body.JSON);
+    }
+
+    /** Whether this connector runs as one of several replicas of the deployment. */
+    public boolean activeActive() {
+        return replicas.activeActive();
+    }
+
+    /** The object source by name, or {@code null}. */
+    public ObjectSource objectSource(String name) {
+        for (ObjectSource source : objects) {
+            if (source.name().equals(name)) {
+                return source;
+            }
+        }
+        return null;
+    }
+
+    /** How an operation answers: rows, an artifact, or an artifact above {@link Artifacts#inlineMax()}. */
+    public enum Result {
+        INLINE, ARTIFACT, AUTO
+    }
+
+    /** What an invoke operation sends: a JSON object, an artifact streamed whole, or an artifact piece by piece. */
+    public enum Body {
+        JSON, ARTIFACT, ARTIFACT_CHUNKED
+    }
+
+    /**
+     * The snapshot rules of a GET operation that serializes application state (CC-D).
+     *
+     * @param consistency {@code snapshot} or {@code best-effort}, as the Worker author declares
+     * @param refresh     the cadence of scheduled snapshots, or {@code null} for none
+     * @param minInterval the least time between two snapshots
+     * @param keep        how many of the newest snapshot roots stay pinned
+     */
+    public record Snapshot(String consistency, Duration refresh, Duration minInterval, int keep) {
+
+        public Snapshot {
+            Objects.requireNonNull(consistency, "consistency");
+            Objects.requireNonNull(minInterval, "minInterval");
+        }
+    }
+
+    /**
+     * The bounds and publish options for artifact results.
+     *
+     * @param maxBytes  the largest body the connector publishes
+     * @param inlineMax the body size above which {@link Result#AUTO} publishes an artifact
+     * @param pieceSize the piece size, or 0 for the fleet's swarm piece size
+     * @param lease     the manifest lease
+     * @param replicate whether the manifest is written to the content space
+     */
+    public record Artifacts(long maxBytes, long inlineMax, int pieceSize, Duration lease, boolean replicate) {
+
+        public Artifacts {
+            Objects.requireNonNull(lease, "lease");
+        }
+
+        /** The defaults: 4 GiB, 4 MiB, the fleet's piece size, seven days, replicated. */
+        public static Artifacts defaults() {
+            return new Artifacts(4L << 30, 4L << 20, 0, Duration.ofDays(7), true);
+        }
+    }
+
+    /**
+     * A deployment's objects served to the swarm where they lie (CC-R).
+     *
+     * @param name       the source's name, unique in the manifest
+     * @param list       the GET path that lists objects
+     * @param get        the GET path that answers a ranged read of one object, by the {@code key} parameter
+     * @param cadence    the list cycle
+     * @param pieceSize  the piece size, or 0 for the artifacts default
+     * @param hashBudget the bytes hashed per list cycle
+     * @param replicate  whether manifests are written to the content space
+     * @param collection the collection card, or {@code null} for none
+     */
+    public record ObjectSource(String name, String list, String get, Duration cadence, int pieceSize, long hashBudget,
+                               boolean replicate, CollectionSpec collection) {
+
+        public ObjectSource {
+            Objects.requireNonNull(name, "name");
+            Objects.requireNonNull(list, "list");
+            Objects.requireNonNull(get, "get");
+            Objects.requireNonNull(cadence, "cadence");
+        }
+    }
+
+    /**
+     * A {@code content-collection} card over an object source.
+     *
+     * @param name        the collection name; the asset is {@code content:<name>}
+     * @param description the card's description, written for the embedder
+     * @param freshness   the card's refresh window
+     */
+    public record CollectionSpec(String name, String description, Duration freshness) {
+
+        public CollectionSpec {
+            Objects.requireNonNull(name, "name");
+            Objects.requireNonNull(description, "description");
+            Objects.requireNonNull(freshness, "freshness");
+        }
+    }
+
+    /**
+     * The change route (CC-N).
+     *
+     * @param path       the GET path answering changes after a cursor
+     * @param poll       the poll interval
+     * @param stream     the Server-Sent Events path over the same cursor, or {@code null}
+     * @param maxChanges the most changes taken per poll
+     */
+    public record Changes(String path, Duration poll, String stream, int maxChanges) {
+
+        public Changes {
+            Objects.requireNonNull(path, "path");
+            Objects.requireNonNull(poll, "poll");
+        }
+    }
+
+    /**
+     * How this connector shares its deployment with other connectors (CC-H).
+     *
+     * @param mode            {@code single} or {@code active-active}
+     * @param nonIdempotentOn in active-active mode, the connector name that alone advertises non-idempotent
+     *                        operations; {@code null} for none
+     */
+    public record Replicas(String mode, String nonIdempotentOn) {
+
+        public Replicas {
+            Objects.requireNonNull(mode, "mode");
+        }
+
+        /** One connector per deployment, as in 0.5.0. */
+        public static Replicas single() {
+            return new Replicas("single", null);
+        }
+
+        /** Whether the active-active mode. */
+        public boolean activeActive() {
+            return mode.equals("active-active");
+        }
     }
 
     /** The HTTP mode of an operation: a {@code GET} is a read operation, a {@code POST} an invoke operation. */
@@ -134,14 +325,45 @@ public record CelldManifest(String application, URI baseUrl, String runtime, Str
      * @param path       the route's path under the base URL
      * @param params     the declared parameter names; any other parameter is refused
      * @param idempotent whether the route deduplicates on {@code Aspace-Invocation-Id}
+     * @param result     how the operation answers: rows, an artifact, or an artifact above the inline bound
+     * @param mediaType  the body's media type, sent as {@code Accept}; JSON for inline results
+     * @param snapshot   the snapshot rules, or {@code null} when the operation is no snapshot
+     * @param body       what an invoke operation sends: JSON, or an artifact named by {@code artifactParam}
+     * @param artifactParam  the parameter that carries the artifact's root, or {@code null}
+     * @param maxUploadBytes the largest artifact an artifact body sends
      */
-    public record Operation(String name, Method method, String path, List<String> params, boolean idempotent) {
+    public record Operation(String name, Method method, String path, List<String> params, boolean idempotent,
+                            Result result, String mediaType, Snapshot snapshot, Body body, String artifactParam,
+                            long maxUploadBytes) {
 
         public Operation {
             Objects.requireNonNull(name, "name");
             Objects.requireNonNull(method, "method");
             Objects.requireNonNull(path, "path");
             params = List.copyOf(Objects.requireNonNull(params, "params"));
+            result = result == null ? Result.INLINE : result;
+            mediaType = mediaType == null ? JSON : mediaType;
+            body = body == null ? Body.JSON : body;
+        }
+
+        /** The 0.5.0 form: an inline JSON operation. */
+        public Operation(String name, Method method, String path, List<String> params, boolean idempotent) {
+            this(name, method, path, params, idempotent, Result.INLINE, JSON, null, Body.JSON, null, 100L << 20);
+        }
+
+        /** Whether the answer may leave as an artifact. */
+        public boolean mayAnswerWithArtifact() {
+            return result != Result.INLINE;
+        }
+
+        /** Whether the body is an artifact the requester names by root. */
+        public boolean takesArtifact() {
+            return body != Body.JSON;
+        }
+
+        /** Whether a snapshot operation. */
+        public boolean isSnapshot() {
+            return snapshot != null;
         }
 
         /** Whether a read operation. */
@@ -327,6 +549,8 @@ public record CelldManifest(String application, URI baseUrl, String runtime, Str
         rejectUnknown(timeouts, TIMEOUT_KEYS, KEY + ".timeouts");
         Duration connect = duration(timeouts, "connect", Duration.ofSeconds(5), KEY + ".timeouts");
         Duration request = duration(timeouts, "request", Duration.ofSeconds(30), KEY + ".timeouts");
+        Duration transfer = duration(timeouts, "transfer", Duration.ofMinutes(30), KEY + ".timeouts");
+        Duration fetch = duration(timeouts, "fetch", Duration.ofMinutes(30), KEY + ".timeouts");
         long maxBody = longValue(tree, "max-body-bytes", 1L << 20);
         if (maxBody <= 0) {
             throw new IllegalArgumentException(KEY + ".max-body-bytes must be positive");
@@ -345,10 +569,109 @@ public record CelldManifest(String application, URI baseUrl, String runtime, Str
             }
             routes.add(route);
         }
-        return new CelldManifest(application, baseUrl, runtime,
-                string(tree, "connector-name", "celld-" + application), string(tree, "group", null),
+        Artifacts artifacts = artifacts(subtree(tree, "artifacts"));
+        List<ObjectSource> objects = objects(tree.get("objects"), artifacts);
+        Changes changes = tree.containsKey("changes") ? changes(subtree(tree, "changes")) : null;
+        Replicas replicas = replicas(subtree(tree, "replicas"));
+        String connectorName = string(tree, "connector-name", "celld-" + application);
+        if (replicas.activeActive()) {
+            for (RouteGroup route : routes) {
+                for (Operation operation : route.operations()) {
+                    if (operation.isInvoke() && !operation.idempotent() && replicas.nonIdempotentOn() == null) {
+                        throw new IllegalArgumentException(KEY + ".routes[" + route.name() + "].operations["
+                                + operation.name() + "] is not idempotent, and replicas.mode is active-active:"
+                                + " name the one connector that advertises it in replicas.non-idempotent-on");
+                    }
+                }
+            }
+        }
+        Path state = tree.containsKey("state") ? Path.of(required(tree, "state", KEY)) : null;
+        return new CelldManifest(application, baseUrl, runtime, connectorName, string(tree, "group", null),
                 string(tree, "space", "data"), credential, connect, request, maxBody, freshness,
-                allowPlaintext, bool(tree, "fleet-authorizer", true), routes);
+                allowPlaintext, bool(tree, "fleet-authorizer", true), routes, artifacts, objects, changes, replicas,
+                transfer, fetch, state);
+    }
+
+    private static Artifacts artifacts(Map<String, Object> tree) {
+        String where = KEY + ".artifacts";
+        rejectUnknown(tree, ARTIFACT_KEYS, where);
+        version(tree, where);
+        long maxBytes = size(tree, "max-bytes", 4L << 30, where);
+        long inlineMax = size(tree, "inline-max", Math.min(4L << 20, maxBytes), where);
+        if (inlineMax > maxBytes) {
+            throw new IllegalArgumentException(where + ".inline-max must not exceed max-bytes");
+        }
+        int pieceSize = tree.containsKey("piece-size") ? pieceSize(tree, where) : 0;
+        Duration lease = duration(tree, "lease", Duration.ofDays(7), where);
+        return new Artifacts(maxBytes, inlineMax, pieceSize, lease, bool(tree, "replicate", true));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<ObjectSource> objects(Object value, Artifacts artifacts) {
+        if (value == null) {
+            return List.of();
+        }
+        if (!(value instanceof List<?> list)) {
+            throw new IllegalArgumentException(KEY + ".objects must be a list of object sources");
+        }
+        List<ObjectSource> sources = new ArrayList<>();
+        Set<String> names = new LinkedHashSet<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> raw)) {
+                throw new IllegalArgumentException(KEY + ".objects entries must be maps");
+            }
+            Map<String, Object> tree = (Map<String, Object>) raw;
+            String where = KEY + ".objects[" + tree.get("name") + "]";
+            rejectUnknown(tree, OBJECT_KEYS, where);
+            version(tree, where);
+            String name = name(required(tree, "name", where), where + ".name");
+            if (!names.add(name)) {
+                throw new IllegalArgumentException(KEY + ".objects names '" + name + "' twice");
+            }
+            String listPath = path(required(tree, "list", where), where + ".list");
+            String getPath = path(required(tree, "get", where), where + ".get");
+            int pieceSize = tree.containsKey("piece-size") ? pieceSize(tree, where) : artifacts.pieceSize();
+            long budget = size(tree, "hash-budget", 2L << 30, where);
+            CollectionSpec collection = null;
+            if (tree.containsKey("collection")) {
+                Object c = tree.get("collection");
+                if (!(c instanceof Map<?, ?> rawCollection)) {
+                    throw new IllegalArgumentException(where + ".collection must be a map");
+                }
+                Map<String, Object> ct = (Map<String, Object>) rawCollection;
+                rejectUnknown(ct, COLLECTION_KEYS, where + ".collection");
+                String cname = name(required(ct, "name", where + ".collection"), where + ".collection.name");
+                collection = new CollectionSpec(cname, string(ct, "description", "Objects " + name
+                        + " of the deployment"), duration(ct, "freshness", Duration.ofMinutes(15), where + ".collection"));
+            }
+            sources.add(new ObjectSource(name, listPath, getPath, duration(tree, "cadence", Duration.ofMinutes(5), where),
+                    pieceSize, budget, bool(tree, "replicate", true), collection));
+        }
+        return sources;
+    }
+
+    private static Changes changes(Map<String, Object> tree) {
+        String where = KEY + ".changes";
+        rejectUnknown(tree, CHANGE_KEYS, where);
+        version(tree, where);
+        String path = path(required(tree, "path", where), where + ".path");
+        String stream = tree.containsKey("stream") ? path(required(tree, "stream", where), where + ".stream") : null;
+        long max = longValue(tree, "max-changes", 1000);
+        if (max <= 0 || max > 100_000) {
+            throw new IllegalArgumentException(where + ".max-changes must be between 1 and 100000");
+        }
+        return new Changes(path, duration(tree, "poll", Duration.ofSeconds(10), where), stream, (int) max);
+    }
+
+    private static Replicas replicas(Map<String, Object> tree) {
+        String where = KEY + ".replicas";
+        rejectUnknown(tree, REPLICA_KEYS, where);
+        version(tree, where);
+        String mode = string(tree, "mode", "single").toLowerCase(Locale.ROOT);
+        if (!mode.equals("single") && !mode.equals("active-active")) {
+            throw new IllegalArgumentException(where + ".mode '" + mode + "' must be single or active-active");
+        }
+        return new Replicas(mode, string(tree, "non-idempotent-on", null));
     }
 
     private static URI baseUrl(String text, boolean allowPlaintext) {
@@ -530,10 +853,132 @@ public record CelldManifest(String application, URI baseUrl, String runtime, Str
             throw new IllegalArgumentException(where + " is a GET route, which is a read operation and always"
                     + " idempotent");
         }
-        return new Operation(name, method, path, params, idempotent);
+        Result result = enumValue(tree, "result", Result.class, Result.INLINE, where);
+        String mediaType = string(tree, "media-type", JSON);
+        if (!mediaType.matches("[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+")) {
+            throw new IllegalArgumentException(where + ".media-type '" + mediaType + "' is not a media type");
+        }
+        if (!mediaType.equalsIgnoreCase(JSON) && result != Result.ARTIFACT) {
+            throw new IllegalArgumentException(where + ".media-type '" + mediaType
+                    + "' is not JSON, so the operation needs result: artifact");
+        }
+        Snapshot snapshot = null;
+        boolean isSnapshot = bool(tree, "snapshot", false);
+        for (String key : List.of("consistency", "refresh", "min-interval", "keep")) {
+            if (!isSnapshot && tree.containsKey(key)) {
+                throw new IllegalArgumentException(where + "." + key + " applies to snapshot: true only");
+            }
+        }
+        if (isSnapshot) {
+            if (method != Method.GET || result != Result.ARTIFACT) {
+                throw new IllegalArgumentException(where + " is a snapshot, which must be a GET with result: artifact");
+            }
+            String consistency = string(tree, "consistency", "best-effort").toLowerCase(Locale.ROOT);
+            if (!consistency.equals("snapshot") && !consistency.equals("best-effort")) {
+                throw new IllegalArgumentException(where + ".consistency '" + consistency
+                        + "' must be snapshot or best-effort");
+            }
+            long keep = longValue(tree, "keep", 1);
+            if (keep < 1 || keep > 1000) {
+                throw new IllegalArgumentException(where + ".keep must be between 1 and 1000");
+            }
+            snapshot = new Snapshot(consistency, duration(tree, "refresh", null, where),
+                    duration(tree, "min-interval", Duration.ofMinutes(1), where), (int) keep);
+        }
+        Body body = enumValue(tree, "body", Body.class, Body.JSON, where);
+        String artifactParam = string(tree, "artifact-param", null);
+        long maxUpload = size(tree, "max-upload-bytes", 100L << 20, where);
+        if (body != Body.JSON) {
+            if (method != Method.POST) {
+                throw new IllegalArgumentException(where + ".body: an artifact body needs a POST route");
+            }
+            if (artifactParam == null || !params.contains(artifactParam)) {
+                throw new IllegalArgumentException(where + ".artifact-param must name one of the params " + params);
+            }
+        } else if (artifactParam != null || tree.containsKey("max-upload-bytes")) {
+            throw new IllegalArgumentException(where + ".artifact-param and max-upload-bytes apply to an artifact body only");
+        }
+        return new Operation(name, method, path, params, idempotent, result, mediaType, snapshot, body,
+                artifactParam, maxUpload);
     }
 
     // ------------------------------------------------------------------ helpers
+
+    private static void version(Map<String, Object> tree, String where) {
+        if (tree.containsKey("v") && longValue(tree, "v", 1) != 1) {
+            throw new IllegalArgumentException(where + ".v " + tree.get("v") + " is not a version this connector reads (1)");
+        }
+    }
+
+    private static String name(String name, String where) {
+        if (!name.matches("[A-Za-z0-9][A-Za-z0-9._-]*")) {
+            throw new IllegalArgumentException(where + " '" + name + "' must be a name of letters, digits, '.', '_', and '-'");
+        }
+        return name;
+    }
+
+    private static String path(String path, String where) {
+        if (!path.startsWith("/") || path.contains("?") || path.contains("#")) {
+            throw new IllegalArgumentException(where + " '" + path + "' must start with '/' and carry no query or fragment");
+        }
+        return path;
+    }
+
+    private static int pieceSize(Map<String, Object> tree, String where) {
+        long size = size(tree, "piece-size", 0, where);
+        if (size < MIN_PIECE || size > MAX_PIECE || Long.bitCount(size) != 1) {
+            throw new IllegalArgumentException(where + ".piece-size " + size
+                    + " must be a power of two from 64KiB to 4MiB");
+        }
+        return (int) size;
+    }
+
+    private static <E extends Enum<E>> E enumValue(Map<String, Object> tree, String key, Class<E> type, E fallback,
+                                                   String where) {
+        String text = string(tree, key, null);
+        if (text == null) {
+            return fallback;
+        }
+        try {
+            return Enum.valueOf(type, text.toUpperCase(Locale.ROOT).replace('-', '_'));
+        } catch (IllegalArgumentException e) {
+            List<String> values = new ArrayList<>();
+            for (E value : type.getEnumConstants()) {
+                values.add(value.name().toLowerCase(Locale.ROOT).replace('_', '-'));
+            }
+            throw new IllegalArgumentException(where + "." + key + " '" + text + "' must be one of " + values);
+        }
+    }
+
+    private static long size(Map<String, Object> tree, String key, long fallback, String where) {
+        Object value = tree.get(key);
+        if (value == null) {
+            return fallback;
+        }
+        long size = parseSize(String.valueOf(value), where + "." + key);
+        if (size <= 0) {
+            throw new IllegalArgumentException(where + "." + key + " must be positive");
+        }
+        return size;
+    }
+
+    /** A byte size: a whole number of bytes, or with {@code KiB}, {@code MiB}, or {@code GiB}. */
+    static long parseSize(String text, String where) {
+        String t = text.strip();
+        try {
+            long unit = 1;
+            String number = t;
+            for (String[] suffix : new String[][]{{"KiB", "1024"}, {"MiB", "1048576"}, {"GiB", "1073741824"}}) {
+                if (t.endsWith(suffix[0])) {
+                    unit = Long.parseLong(suffix[1]);
+                    number = t.substring(0, t.length() - suffix[0].length()).strip();
+                }
+            }
+            return Math.multiplyExact(Long.parseLong(number), unit);
+        } catch (RuntimeException e) {
+            throw new IllegalArgumentException(where + " '" + text + "' is not a size (4194304, 64KiB, 4MiB, 1GiB)");
+        }
+    }
 
     private static void rejectUnknown(Map<String, Object> tree, Set<String> known, String where) {
         List<String> unknown = new ArrayList<>();

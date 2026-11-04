@@ -132,6 +132,11 @@
       <groupId>ai.badmonkey.agentspaces</groupId>
       <artifactId>agentspaces-connect-core</artifactId>
     </dependency>
+    <!-- Large results, object sources, and artifact inputs travel through the content swarm. -->
+    <dependency>
+      <groupId>ai.badmonkey.agentspaces</groupId>
+      <artifactId>agentspaces-content</artifactId>
+    </dependency>
     <!-- The main: the agentspaces.* fleet file, the peer, the groups, and the card cadence. -->
     <dependency>
       <groupId>ai.badmonkey.agentspaces</groupId>

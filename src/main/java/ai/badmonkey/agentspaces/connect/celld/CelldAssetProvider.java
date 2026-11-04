@@ -20,6 +20,7 @@ import ai.badmonkey.agentspaces.common.id.GroupId;
 import ai.badmonkey.agentspaces.common.id.PeerId;
 import ai.badmonkey.agentspaces.connect.AssetInvocations;
 import ai.badmonkey.agentspaces.connect.AssetProvider;
+import ai.badmonkey.agentspaces.connect.MaterializingAssetProvider;
 import com.fasterxml.jackson.databind.JsonNode;
 
 import java.time.Duration;
@@ -30,12 +31,13 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Consumer;
 
 /**
- * The {@link AssetProvider} over a manifest of allowlisted Worker routes
- * (srad/agentspaces-js.md JS-C-09, appendix F): the same mapping
- * {@code @agentspaces/workers} runs inside a deployment, run from outside it
- * over HTTPS for a deployment its team cannot change.
+ * The {@link AssetProvider} over a manifest of allowlisted Worker routes: the
+ * same mapping {@code @agentspaces/workers} runs inside a deployment, run
+ * beside it over HTTPS, so a team serves an existing deployment to the fleet
+ * without changing its code or bindings.
  *
  * <ul>
  *   <li>{@link #describeAssets} publishes one {@code workers://<application>/route/<name>}
@@ -53,13 +55,20 @@ import java.util.Objects;
  *       result map.</li>
  * </ul>
  *
+ * <p>An operation with {@code result: artifact} (or {@code auto}, above the inline
+ * bound) answers one artifact row through {@link ArtifactResults}; an operation with
+ * an artifact body sends the artifact the requester names through
+ * {@link ArtifactUploads}. Both need the group's content swarm. Changes the
+ * {@link ChangeWatcher} reads become {@code AssetChange} entries through
+ * {@link #materialize(Consumer)}.
+ *
  * <p>A route group or operation the manifest does not list, or a parameter an
  * operation does not declare, is refused with an error naming the rule and the
  * deployment is never called (JS-C-07). The {@code ConnectorRuntime} applies
  * the card's {@code invoke-ops} and the fleet's scopes before this provider
  * sees an invocation; the checks here hold even for a caller that bypasses it.
  */
-public final class CelldAssetProvider implements AssetProvider {
+public final class CelldAssetProvider implements MaterializingAssetProvider {
 
     /** The {@code access} key listing the read operations as a comma list. */
     public static final String READ_OPS = "read-ops";
@@ -69,9 +78,26 @@ public final class CelldAssetProvider implements AssetProvider {
     public static final String PARAMS_PREFIX = "params-";
     /** The {@code access.connector} value of this connector. */
     public static final String CONNECTOR = "java";
+    /** The {@code access} key listing the operations whose result is an artifact. */
+    public static final String ARTIFACT_OPS = "artifact-ops";
+    /** The prefix of the {@code access} keys naming an artifact operation's media type. */
+    public static final String MEDIA_TYPE_PREFIX = "media-type-";
+    /** The {@code access} key listing the snapshot operations. */
+    public static final String SNAPSHOT_OPS = "snapshot-ops";
+    /** The prefix of the {@code access} keys naming a snapshot's declared consistency. */
+    public static final String CONSISTENCY_PREFIX = "consistency-";
+    /** The {@code access} key listing the operations that take an artifact body. */
+    public static final String UPLOAD_OPS = "upload-ops";
+    /** The prefix of the {@code access} keys naming the parameter that carries an artifact's root. */
+    public static final String ARTIFACT_PARAM_PREFIX = "artifact-param-";
+    /** The {@code access} key saying a change route covers the group. */
+    public static final String CHANGES = "changes";
 
     private final CelldManifest manifest;
     private final CelldClient client;
+    private volatile ArtifactResults artifacts;
+    private volatile ArtifactUploads uploads;
+    private volatile Consumer<Change> sink;
 
     /** Creates the provider with a client over the manifest's deployment. */
     public CelldAssetProvider(CelldManifest manifest) {
@@ -94,6 +120,43 @@ public final class CelldAssetProvider implements AssetProvider {
         return client;
     }
 
+    /** Gives the provider the large-result path; without it an artifact operation answers an error. */
+    public CelldAssetProvider artifacts(ArtifactResults artifacts) {
+        this.artifacts = artifacts;
+        return this;
+    }
+
+    /** Gives the provider the artifact-body path; without it an upload operation answers an error. */
+    public CelldAssetProvider uploads(ArtifactUploads uploads) {
+        this.uploads = uploads;
+        return this;
+    }
+
+    @Override
+    public AutoCloseable materialize(Consumer<Change> changes) {
+        this.sink = changes;
+        return () -> this.sink = null;
+    }
+
+    /** Pushes one change to the runtime's change space; a no-op before the runtime starts. */
+    void emit(Change change) {
+        Consumer<Change> current = sink;
+        if (current != null) {
+            current.accept(change);
+        }
+    }
+
+    /**
+     * Whether this connector advertises an operation: in active-active mode a non-idempotent
+     * operation is advertised only by the connector {@code replicas.non-idempotent-on} names (CC-H-04).
+     */
+    boolean advertises(CelldManifest.Operation operation) {
+        if (!manifest.activeActive() || !operation.isInvoke() || operation.idempotent()) {
+            return true;
+        }
+        return manifest.connectorName().equals(manifest.replicas().nonIdempotentOn());
+    }
+
     @Override
     public List<AssetCard> describeAssets(GroupId group, PeerId issuer, Instant now) {
         List<AssetCard> cards = new ArrayList<>();
@@ -107,7 +170,7 @@ public final class CelldAssetProvider implements AssetProvider {
     public AssetCard card(CelldManifest.RouteGroup route, GroupId group, PeerId issuer, Instant now) {
         Duration freshness = route.freshness() != null ? route.freshness() : manifest.freshness();
         List<CelldManifest.Operation> reads = route.readOperations();
-        List<CelldManifest.Operation> invokes = route.invokeOperations();
+        List<CelldManifest.Operation> invokes = route.invokeOperations().stream().filter(this::advertises).toList();
         Map<String, String> access = new LinkedHashMap<>();
         String mode = !reads.isEmpty() && !invokes.isEmpty() ? "read-only,invoke"
                 : invokes.isEmpty() ? "read-only" : "invoke";
@@ -121,14 +184,38 @@ public final class CelldAssetProvider implements AssetProvider {
             access.put(AssetInvocations.INVOKE_OPS, names(invokes));
             access.put(IDEMPOTENT, names(invokes.stream().filter(CelldManifest.Operation::idempotent).toList()));
         }
-        for (CelldManifest.Operation operation : route.operations()) {
+        List<CelldManifest.Operation> advertised = route.operations().stream().filter(this::advertises).toList();
+        for (CelldManifest.Operation operation : advertised) {
             access.put(PARAMS_PREFIX + operation.name(), String.join(",", operation.params()));
+        }
+        List<CelldManifest.Operation> artifactOps = advertised.stream()
+                .filter(CelldManifest.Operation::mayAnswerWithArtifact).toList();
+        if (!artifactOps.isEmpty()) {
+            access.put(ARTIFACT_OPS, names(artifactOps));
+            artifactOps.forEach(o -> access.put(MEDIA_TYPE_PREFIX + o.name(), o.mediaType()));
+        }
+        List<CelldManifest.Operation> snapshots = advertised.stream().filter(CelldManifest.Operation::isSnapshot).toList();
+        if (!snapshots.isEmpty()) {
+            access.put(SNAPSHOT_OPS, names(snapshots));
+            snapshots.forEach(o -> access.put(CONSISTENCY_PREFIX + o.name(), o.snapshot().consistency()));
+        }
+        List<CelldManifest.Operation> uploadOps = advertised.stream()
+                .filter(CelldManifest.Operation::takesArtifact).toList();
+        if (!uploadOps.isEmpty()) {
+            access.put(UPLOAD_OPS, names(uploadOps));
+            uploadOps.forEach(o -> access.put(ARTIFACT_PARAM_PREFIX + o.name(), o.artifactParam()));
+        }
+        if (manifest.changes() != null) {
+            access.put(CHANGES, "true");
         }
         access.put("runtime", manifest.runtime());
         access.put("connector", CONNECTOR);
         Map<String, String> costHints = new LinkedHashMap<>();
         costHints.put("operations", Integer.toString(route.operations().size()));
-        return new AssetCard(manifest.application() + ":" + route.asset(), issuer, group, now,
+        // The ad cache keys cards by id alone, so each replica's card needs an id of its own (CC-H-01).
+        String id = manifest.application() + ":" + route.asset()
+                + (manifest.activeActive() ? "@" + manifest.connectorName() : "");
+        return new AssetCard(id, issuer, group, now,
                 freshness.multipliedBy(2), route.asset(),
                 "workers://" + manifest.application() + "/" + route.asset(),
                 route.description(), route.shape(), freshness.toString(), costHints, access);
@@ -161,6 +248,18 @@ public final class CelldAssetProvider implements AssetProvider {
         if (undeclared != null) {
             return QueryResult.failed(undeclared);
         }
+        if (operation.mayAnswerWithArtifact()) {
+            ArtifactResults path = artifacts;
+            if (path == null) {
+                return QueryResult.failed("artifacts: operation '" + opName + "' answers with an artifact, and the"
+                        + " fleet's content swarm is off (agentspaces.content.enabled)");
+            }
+            try {
+                return QueryResult.of(path.answer(route, operation, declared, null).rows());
+            } catch (CelldClient.RouteException e) {
+                return QueryResult.failed(e.rule() + ": " + e.getMessage());
+            }
+        }
         CelldClient.Response response;
         try {
             response = client.get(operation, declared);
@@ -177,14 +276,20 @@ public final class CelldAssetProvider implements AssetProvider {
     @Override
     public InvokeResult invoke(String asset, String operationName, Map<String, String> params,
                                String invocationId) {
+        return invoke(asset, operationName, params, invocationId, null);
+    }
+
+    @Override
+    public InvokeResult invoke(String asset, String operationName, Map<String, String> params,
+                               String invocationId, PeerId requester) {
         CelldManifest.RouteGroup route = manifest.route(asset);
         if (route == null) {
             return InvokeResult.failed("unknown-operation", "routes", "no route group named '" + asset
                     + "' in the manifest");
         }
         CelldManifest.Operation operation = route.operation(operationName);
-        if (operation == null || !operation.isInvoke()) {
-            List<CelldManifest.Operation> invokes = route.invokeOperations();
+        if (operation == null || !operation.isInvoke() || !advertises(operation)) {
+            List<CelldManifest.Operation> invokes = route.invokeOperations().stream().filter(this::advertises).toList();
             return InvokeResult.failed("unknown-operation", AssetInvocations.INVOKE_OPS, "operation '"
                     + operationName + "' is not a POST route of asset '" + asset + "' ("
                     + (invokes.isEmpty() ? "none" : names(invokes)) + ")");
@@ -192,6 +297,27 @@ public final class CelldAssetProvider implements AssetProvider {
         String undeclared = undeclared(operation, params);
         if (undeclared != null) {
             return InvokeResult.failed("bad-params", "params", undeclared.substring("params: ".length()));
+        }
+        if (operation.takesArtifact()) {
+            ArtifactUploads path = uploads;
+            if (path == null) {
+                return InvokeResult.failed("target-error", "artifacts", "operation '" + operationName
+                        + "' takes an artifact body, and the fleet's content swarm is off (agentspaces.content.enabled)");
+            }
+            return path.upload(operation, params, invocationId, requester);
+        }
+        if (operation.mayAnswerWithArtifact()) {
+            ArtifactResults path = artifacts;
+            if (path == null) {
+                return InvokeResult.failed("target-error", "artifacts", "operation '" + operationName
+                        + "' answers with an artifact, and the fleet's content swarm is off (agentspaces.content.enabled)");
+            }
+            try {
+                List<Map<String, String>> rows = path.answer(route, operation, params, invocationId).rows();
+                return InvokeResult.of(rows.isEmpty() ? Map.of() : rows.getFirst());
+            } catch (CelldClient.RouteException e) {
+                return InvokeResult.failed(e.error(), e.rule(), e.getMessage());
+            }
         }
         CelldClient.Response response;
         try {

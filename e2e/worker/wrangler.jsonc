@@ -1,0 +1,15 @@
+// The test application the end-to-end harness deploys to a local celld (see ../README.md).
+// celld reads wrangler.jsonc and bundles `main` with esbuild; every key here is one celld accepts.
+{
+  "name": "inventory",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "durable_objects": {
+    "bindings": [{ "name": "INVENTORY", "class_name": "Inventory" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Inventory"] }],
+  "r2_buckets": [
+    { "binding": "MODELS", "bucket_name": "models" },
+    { "binding": "INGEST", "bucket_name": "ingest" }
+  ]
+}

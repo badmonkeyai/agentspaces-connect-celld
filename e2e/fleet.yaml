@@ -1,0 +1,18 @@
+# The connector's peer for the end-to-end run. The live test starts its own agent peer, which
+# dials this one as its seed.
+agentspaces:
+  bind: 127.0.0.1:7740
+  tick-millis: 100
+  capabilities: { enabled: true }
+  content:
+    enabled: true
+    piece-size: 1048576
+    store:
+      backends: [file]
+      path: .state/connector-content
+      cache-external: true
+  groups:
+    - name: celld-e2e
+      founding: celld-e2e-v1
+      spaces:
+        - { name: data, settle-window-millis: 100 }

@@ -1,0 +1,13 @@
+{
+  "name": "agentspaces-connect-celld-e2e",
+  "private": true,
+  "description": "The local end-to-end harness for agentspaces-connect-celld: Azurite as the fleet bucket, one celld node, the inventory test application, and the Java connector's live test.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@agentspaces/workers": "file:../../agentspaces-typescript/packages/workers",
+    "@azure/storage-blob": "^12.28.0",
+    "azurite": "^3.35.0",
+    "esbuild": "^0.25.0"
+  }
+}

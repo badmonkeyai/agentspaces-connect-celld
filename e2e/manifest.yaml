@@ -1,0 +1,46 @@
+# The connector's manifest for the inventory application on the local celld node. celld's public
+# listener terminates no TLS and authenticates nobody, so on loopback the run uses plaintext and a
+# token nothing checks; a deployment puts a proxy in front (see the connector README).
+celld:
+  application: inventory
+  base-url: http://127.0.0.1:18787   # the live test uses CELLD_E2E_URL instead
+  allow-plaintext: true
+  runtime: celld
+  connector-name: inventory-e2e
+  credential: { bearer: e2e-token }
+  state: .state/connector
+  freshness: PT1M
+  timeouts: { request: 30s, transfer: 10m, fetch: 10m }
+  artifacts: { max-bytes: 1GiB, piece-size: 1MiB }
+  routes:
+    - name: stock
+      description: Stock levels by SKU, owned by one Durable Object
+      shape: com.example.Stock#v1
+      operations:
+        - { name: getStock, method: GET, path: /api/stock, params: [sku] }
+        - { name: reserveStock, method: POST, path: /api/stock/reserve, params: [sku, qty] }
+        - { name: setStock, method: POST, path: /api/stock/set, params: [sku, qty] }
+        - { name: snapshot, method: GET, path: /api/stock/snapshot, result: artifact,
+            media-type: application/x-ndjson, snapshot: true, consistency: snapshot, keep: 2, min-interval: 1s }
+    - name: exports
+      description: The generated nightly export
+      operations:
+        - { name: nightly, method: GET, path: /api/exports/nightly, params: [mb], result: artifact,
+            media-type: application/x-ndjson }
+    - name: ingest
+      description: Datasets the fleet hands to the deployment
+      operations:
+        - { name: load, method: POST, path: /api/ingest, params: [source, batch], body: artifact,
+            artifact-param: source, max-upload-bytes: 1GiB }
+        - { name: loadChunked, method: POST, path: /api/ingest, params: [source], body: artifact-chunked,
+            artifact-param: source }
+        - { name: ingested, method: GET, path: /api/ingested, params: [key] }
+  objects:
+    - name: models
+      list: /api/models
+      get: /api/models/object
+      cadence: PT5S
+      piece-size: 4MiB
+      hash-budget: 2GiB
+      collection: { name: models, description: Model checkpoints of the inventory deployment }
+  changes: { path: /api/changes, poll: 1s, stream: /api/changes/stream }
