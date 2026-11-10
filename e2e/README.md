@@ -19,7 +19,7 @@ The steps also run one at a time: `setup`, `up`, `seed`, `test`, `down`.
 
 - macOS on Apple Silicon, or Linux on x86-64 or ARM64 (the platforms celld publishes binaries for).
 - Node 22 or newer, and npm.
-- Java 21 or newer and Maven, with the AgentSpaces 0.5.0 artifacts in the local Maven repository
+- Java 21 or newer and Maven, with the AgentSpaces 0.6.0 artifacts in the local Maven repository
   (`mvn install` of the core reactor and of `agentspaces-langchain4j`).
 - The TypeScript packages built once: `npm test` in `agentspaces-typescript/packages/workers`
   writes the `build/` the Worker imports from.
